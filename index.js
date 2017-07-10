@@ -5,15 +5,16 @@ const path = require('path');
 
 const {trimStart, trimEnd, map, filter, size, intersection} = require('lodash');
 
-const env      = require('node-env-file');
-const chalk    = require('chalk');
-const Promise  = require('promise');
-const globby   = require('globby');
-const makeDir  = require('make-dir');
-const ncp      = Promise.denodeify(require('ncp').ncp);
-const mv       = Promise.denodeify(require('mv'));
-const readFile = Promise.denodeify(require('fs').readFile);
-const access   = Promise.denodeify(require('fs').access);
+const env          = require('node-env-file');
+const chalk        = require('chalk');
+const Promise      = require('promise');
+const globby       = require('globby');
+const makeDir      = require('make-dir');
+const randomstring = require('randomstring');
+const ncp          = Promise.denodeify(require('ncp').ncp);
+const mv           = Promise.denodeify(require('mv'));
+const readFile     = Promise.denodeify(require('fs').readFile);
+const access       = Promise.denodeify(require('fs').access);
 
 class Interruption extends Error {
 
@@ -46,10 +47,25 @@ const wpFolders = [
 
 const wpConfig = (template, env) => {
 
-    template = template.replace('database_name_here', env['DB_NAME']);
-    template = template.replace('username_here', env['DB_USER']);
-    template = template.replace('password_here', env['DB_PASSWORD']);
-    template = template.replace('localhost', env['DB_HOST']);
+    const findReplace = [
+        ['database_name_here', env['DB_NAME']],
+        ['username_here', env['DB_USER']],
+        ['password_here', env['DB_PASSWORD']],
+        ['localhost', env['DB_HOST']],
+
+        [`define('WP_DEBUG', false)`, `define('WP_DEBUG', ${(env['WP_ENV'] === 'development' ? 'true' : 'false')})`],
+
+        [/\$table_prefix\s*=\s*'wp_'/, env['DB_PREFIX'] ? `$table_prefix = '${env['DB_PREFIX']}'` : null],
+    ];
+
+    for (const [find, replace] of findReplace) {
+        if (replace === null) continue;
+        template = template.replace(find, replace);
+    }
+
+    while (template.indexOf('put your unique phrase here') !== -1) {
+        template = template.replace('put your unique phrase here', randomstring.generate(64));
+    }
 
     return template;
 };
@@ -61,6 +77,11 @@ class Engine {
         this.opts = opts;
     }
 
+    /**
+     * Get absolute path based on (relative) path
+     * @param path
+     * @returns {string}
+     */
     abs(path) {
         return `${this.root}/${trimStart(path, '/')}`;
     }
@@ -109,6 +130,11 @@ class Engine {
                 + ', remove one to continue');
     }
 
+    /**
+     * Move the given wp content type folder from web/app to web/wp/wp-content
+     * @param wpFolder
+     * @returns {Promise.<boolean>}
+     */
     async moveWpContents(wpFolder) {
         const cwd = `web/app/${wpFolder}`;
         if (!await this.exists(cwd)) return false;
@@ -127,12 +153,21 @@ class Engine {
         }
     }
 
+    /**
+     * Run some sanity checks
+     * @returns {Promise.<void>}
+     */
     async sanityChecks() {
         await this.checkPresence();
         for (const wpFolder of wpFolders)
             await this.checkConflicts(`web/app/${wpFolder}`, `web/wp/wp-content/${wpFolder}`);
     }
 
+    /**
+     * Archive the given file/directory into ".debedrockify/old"
+     * @param path
+     * @returns {Promise.<boolean>}
+     */
     async archive(path) {
         if (!await this.exists(path)) return false;
         path = trimStart(path, '/');
@@ -140,6 +175,10 @@ class Engine {
         await mv(this.abs(path), this.abs(`.debedrockify/old/${path}`));
     }
 
+    /**
+     * Convert .env to wp-config.php
+     * @returns {Promise.<void>}
+     */
     async envToWpConfig() {
         console.info('Translating .env to wp-config.php');
         const template = (await readFile(this.abs('web/wp/wp-config-sample.php'))).toString();
@@ -163,7 +202,6 @@ class Engine {
         // await this.archive('web/wp-config.php');
 
         await this.envToWpConfig();
-
     }
 }
 
