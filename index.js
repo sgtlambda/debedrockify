@@ -5,16 +5,22 @@ const path = require('path');
 
 const {trimStart, trimEnd, map, filter, size, intersection} = require('lodash');
 
+const spawn = require('child_process').spawn;
+
+const fs           = require('fs');
 const env          = require('node-env-file');
 const chalk        = require('chalk');
 const Promise      = require('promise');
 const globby       = require('globby');
 const makeDir      = require('make-dir');
 const randomstring = require('randomstring');
-const ncp          = Promise.denodeify(require('ncp').ncp);
-const mv           = Promise.denodeify(require('mv'));
-const readFile     = Promise.denodeify(require('fs').readFile);
-const access       = Promise.denodeify(require('fs').access);
+const mysql        = require('promise-mysql');
+
+const ncp       = Promise.denodeify(require('ncp').ncp);
+const mv        = Promise.denodeify(require('mv'));
+const readFile  = Promise.denodeify(require('fs').readFile);
+const writeFile = Promise.denodeify(require('fs').writeFile);
+const access    = Promise.denodeify(require('fs').access);
 
 class Interruption extends Error {
 
@@ -29,11 +35,15 @@ const yargs = require('yargs')
 
 const formatPaths = paths => `"${paths.join('", "')}"`;
 
-const expected = [
+const expectedPresent = [
     '.env',
     'web/app',
     'web/wp',
     'web/wp/wp-config-sample.php',
+];
+
+const expectedAbsent = [
+    'web/wp/wp-config.php',
 ];
 
 const wpFolders = [
@@ -45,7 +55,7 @@ const wpFolders = [
     'upgrade'
 ];
 
-const wpConfig = (template, env) => {
+const populateWpConfig = (template, env) => {
 
     const findReplace = [
         ['database_name_here', env['DB_NAME']],
@@ -70,6 +80,8 @@ const wpConfig = (template, env) => {
     return template;
 };
 
+const mysqldump = ({user, password, database}) => spawn('mysqldump', ['-u', user, '-p' + password, database]);
+
 class Engine {
 
     constructor(root, opts) {
@@ -91,8 +103,8 @@ class Engine {
      * @param relPath
      * @returns {Promise.<void>}
      */
-    async exists(relPath) {
-        await access(this.abs(relPath)).then(() => true, () => false);
+    exists(relPath) {
+        return access(this.abs(relPath)).then(() => true, () => false);
     }
 
     /**
@@ -109,10 +121,34 @@ class Engine {
      * Check if the given paths exist and throw an Interruption if it doesn't
      * @returns {Promise.<void>}
      */
-    async checkPresence(paths = expected) {
-        const absent = await Promise.all(map(paths, p => access(this.abs(p)).then(null, () => p)));
-        if (size(filter(absent)))
-            throw new Interruption(`${formatPaths(filter(absent))} not present`);
+    async checkPresence() {
+
+        /**
+         * Get presence status for given paths (as an array of [path, present])
+         * @param paths
+         */
+        const checkAllPairs = paths => Promise.all(map(paths, async path => {
+            const exists = await this.exists(path);
+            return [path, exists];
+        }));
+
+        /**
+         * Returns an array of all paths that do not match the expected presence status
+         * @param paths
+         * @param presentExpected
+         * @returns {Promise.<*>}
+         */
+        const filterByStatus = async (paths, presentExpected) => {
+            const pairs      = await checkAllPairs(paths);
+            const violations = filter(pairs, ([_, present]) => present !== presentExpected);
+            return map(violations, ([file]) => file);
+        };
+
+        const absent = await filterByStatus(expectedPresent, true);
+        if (size(absent)) throw new Interruption(`Expected file(s): ${formatPaths(absent)} not present`);
+
+        const present = await filterByStatus(expectedAbsent, false);
+        if (size(present)) throw new Interruption(`Unexpected file(s): ${formatPaths(present)} present`);
     }
 
     /**
@@ -175,23 +211,93 @@ class Engine {
         await mv(this.abs(path), this.abs(`.debedrockify/old/${path}`));
     }
 
+    readEnv() {
+        this.env = env(this.abs('.env'));
+    }
+
+    mysqlBackup() {
+        console.log('Backing up database...');
+        const process = mysqldump({
+            user:     this.env['DB_USER'],
+            password: this.env['DB_PASSWORD'],
+            database: this.env['DB_NAME'],
+        });
+        const dest    = this.abs(`.debedrockify/mysql_backup_${(new Date()).getTime()}.sql`);
+        return new Promise((resolve, reject) => {
+            process
+                .stdout
+                .pipe(fs.createWriteStream(dest))
+                .on('finish', function () {
+                    resolve();
+                })
+                .on('error', function (err) {
+                    reject(err);
+                });
+        });
+    }
+
     /**
      * Convert .env to wp-config.php
      * @returns {Promise.<void>}
      */
     async envToWpConfig() {
-        console.info('Translating .env to wp-config.php');
+        console.info('Populating wp-config.php based on .env');
         const template = (await readFile(this.abs('web/wp/wp-config-sample.php'))).toString();
-        const envs     = env(this.abs('.env'));
-        const conf     = wpConfig(template, envs);
-        console.log(conf);
+        const wpConfig = populateWpConfig(template, this.env);
+        await writeFile(this.abs('web/wp/wp-config.php'), wpConfig);
     }
 
+    async mysqlConnect() {
+        this.mysql = await mysql.createConnection({
+            host:     this.env['DB_HOST'],
+            user:     this.env['DB_USER'],
+            password: this.env['DB_PASSWORD'],
+            database: this.env['DB_NAME'],
+        });
+    }
+
+    async mysqlDisconnect() {
+        return await this.mysql.end();
+    }
+
+    async mysqlQuery(...args) {
+        return await this.mysql.query(...args);
+    }
+
+    /**
+     * Update the values of "siteurl" and "home" in the database
+     * @returns {Promise.<void>}
+     */
+    async updateDbSiteUrl() {
+        console.info('Updating "siteurl" and "home" in the database...');
+        await this.mysqlQuery("DELETE FROM `wp_options` WHERE `option_name` IN ('siteurl', 'home')");
+        const url = this.env['WP_HOME'];
+        await this.mysqlQuery("INSERT INTO `wp_options` (`option_name`, `option_value`) VALUES (?, ?)", ['siteurl', url]);
+        await this.mysqlQuery("INSERT INTO `wp_options` (`option_name`, `option_value`) VALUES (?, ?)", ['home', url]);
+    }
+
+    /**
+     * Do all database procedures
+     * @returns {Promise.<void>}
+     */
+    async doDb() {
+
+        await this.mysqlBackup();
+
+        await this.mysqlConnect();
+        await this.updateDbSiteUrl();
+        await this.mysqlDisconnect();
+    }
+
+    /**
+     * Full procedure runner
+     * @returns {Promise.<void>}
+     */
     async run() {
         await this.sanityChecks();
         // if (!this.opts.skipBackup) await this.backup(root);
 
-        // await makeDir(this.abs(`.debedrockify/old`));
+        await makeDir(this.abs(`.debedrockify/old`));
 
         // for (const wpFolder of wpFolders)
         //     await this.moveWpContents(wpFolder);
@@ -201,22 +307,31 @@ class Engine {
         // await this.archive('web/index.php');
         // await this.archive('web/wp-config.php');
 
+        this.readEnv();
+
         await this.envToWpConfig();
+
+        await this.doDb();
     }
 }
 
 (async () => {
 
-    const engine = new Engine(trimEnd(process.cwd(), '/'), yargs);
+    const root   = trimEnd(process.cwd(), '/');
+    const engine = new Engine(root, yargs);
 
-    await engine.run();
+    try {
 
-})().then(() => null, e => {
-    if (e instanceof Interruption) {
-        console.error(chalk.red(e.message));
-        process.exit(1);
-    } else {
-        console.error(e.message);
-        process.exit(127);
+        await engine.run();
+
+    } catch (e) {
+
+        if (e instanceof Interruption) {
+            console.error(chalk.red(e.message));
+            process.exit(1);
+        } else {
+            console.error(e);
+            process.exit(127);
+        }
     }
-});
+})();
