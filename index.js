@@ -41,13 +41,13 @@ class Engine {
         this.opts = opts;
     }
 
-    async makeBackup() {
+    async backup() {
         const backup = `${this.root}.backup.${(new Date()).getTime()}`;
         console.info(`Creating backup at ${backup}...`);
         await ncp(root, backup);
     }
 
-    async checkPaths() {
+    async checkPresence() {
         const absent = await Promise.all(map(expected, p => access(`${this.root}/${p}`).then(null, () => p)));
         if (size(filter(absent)))
             throw new Interruption(`${formatPaths(filter(absent))} not present`);
@@ -62,10 +62,6 @@ class Engine {
         if (size(intersect))
             throw new Interruption(`Conflict: ${formatPaths(intersect)} present in both ${path1} and ${path2}`
                 + ', remove one to continue');
-    }
-
-    checkWpConflicts(wpFolder) {
-        return this.checkConflicts(`web/app/${wpFolder}`, `web/wp/wp-content/${wpFolder}`);
     }
 
     async moveWpContents(wpFolder) {
@@ -87,19 +83,18 @@ class Engine {
         // const contents = await
     }
 
+    async sanityChecks() {
+        await this.checkPresence();
+        for (const wpFolder of wpFolders)
+            await this.checkConflicts(`web/app/${wpFolder}`, `web/wp/wp-content/${wpFolder}`);
+    }
+
     async run() {
-
-        await this.checkPaths();
-
-        for (const wpFolder of wpFolders) {
-            await this.checkWpConflicts(wpFolder);
-        }
-
-        for (const wpFolder of wpFolders) {
+        await this.sanityChecks();
+        if (!this.opts.skipBackup) await this.backup(root);
+        for (const wpFolder of wpFolders)
             await this.moveWpContents(wpFolder);
-        }
-
-        if (!this.opts.skipBackup) await this.makeBackup(root);
+        
     }
 }
 
