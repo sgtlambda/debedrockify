@@ -211,10 +211,17 @@ class Engine {
         await mv(this.abs(path), this.abs(`.debedrockify/old/${path}`));
     }
 
+    /**
+     * Read .env into this.env
+     */
     readEnv() {
         this.env = env(this.abs('.env'));
     }
 
+    /**
+     * Create a dump of the entire database
+     * @returns {*|Promise}
+     */
     mysqlBackup() {
         console.log('Backing up database...');
         const process = mysqldump({
@@ -247,6 +254,10 @@ class Engine {
         await writeFile(this.abs('web/wp/wp-config.php'), wpConfig);
     }
 
+    /**
+     * Start mysql connection
+     * @returns {Promise.<void>}
+     */
     async mysqlConnect() {
         this.mysql = await mysql.createConnection({
             host:     this.env['DB_HOST'],
@@ -256,6 +267,10 @@ class Engine {
         });
     }
 
+    /**
+     * End mysql connection
+     * @returns {Promise.<*|number>}
+     */
     async mysqlDisconnect() {
         return await this.mysql.end();
     }
